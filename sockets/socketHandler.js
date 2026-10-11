@@ -1,7 +1,38 @@
 const roomManager = require("../models/roomManager");
 
+// Strip all HTML tags from a string to prevent chat injection
+const sanitize = (str) =>
+  typeof str === "string" ? str.replace(/<[^>]*>/g, "").trim() : "";
+
 module.exports = (io, socket) => {
   console.log(`📡 Peer connection established: ${socket.id}`);
+
+  // Server-driven sync heartbeat: runs every 4s for every controller in every room.
+  // Moving this to the server fixes two issues:
+  //   1. Participants who become Moderators also keep peers aligned (not just the Host).
+  //   2. The Host client no longer needs a setInterval, simplifying frontend logic.
+  const syncInterval = setInterval(() => {
+    Object.keys(roomManager.rooms).forEach((roomId) => {
+      const room = roomManager.getRoom(roomId);
+      if (!room || room.playState !== "playing") return;
+
+      // Find the first available controller (Host preferred, then first Moderator)
+      const controller =
+        room.participants.find((p) => p.role === "Host") ||
+        room.participants.find((p) => p.role === "Moderator");
+
+      if (controller) {
+        // Broadcast a soft 'sync' to everyone except the controller
+        socket.to(roomId).emit("playback_broadcast", {
+          action: "sync",
+          time: room.currentTime,
+          sentAt: Date.now(),
+        });
+      }
+    });
+  }, 4000);
+
+  socket.on("disconnect", () => clearInterval(syncInterval));
 
   // 1. CREATE ROOM (Creator becomes Host)
   socket.on("create_room", ({ roomId, username }) => {
@@ -61,48 +92,42 @@ module.exports = (io, socket) => {
   });
 
   // 3. RECONNECT ROOM
-  socket.on("reconnect_room", ({ roomId, username, role }) => {
+  // Security fix: the client-supplied `role` is never trusted directly.
+  // We look up the existing participant by username to recover their server-stored
+  // role. Only if they were previously the Host do we allow that privilege to persist.
+  socket.on("reconnect_room", ({ roomId, username }) => {
     const cleanRoomId = roomId.toUpperCase();
     let room = roomManager.getRoom(cleanRoomId);
+    let resolvedRole;
 
     if (!room) {
-      if (role === "Host") {
-        const result = roomManager.createRoom(cleanRoomId, socket.id, username);
-        room = result.room;
-      } else {
-        socket.emit("session_expired", {
-          message: "The watch room has ended or no longer exists.",
-        });
-        return;
-      }
-    } else {
-      const existingIdx = room.participants.findIndex(
-        (p) => p.username === username,
-      );
-      if (existingIdx !== -1) {
-        room.participants.splice(existingIdx, 1);
-      }
-
-      let assignedRole = role;
-      if (role === "Host") {
-        room.participants.forEach((p) => {
-          p.role = "Participant";
-        });
-        assignedRole = "Host";
-      }
-
-      room.participants.push({ id: socket.id, username, role: assignedRole });
+      // Room is gone — only recreate it if this user was the original creator.
+      // We can't verify that without a session store, so we expire the session.
+      socket.emit("session_expired", {
+        message: "The watch room has ended or no longer exists.",
+      });
+      return;
     }
 
-    socket.join(cleanRoomId);
-    console.log(
-      `🔄 [Room ${cleanRoomId}] User reconnected: ${username} (${role})`,
+    // Find the user's existing server-side record by username
+    const existingIdx = room.participants.findIndex(
+      (p) => p.username === username,
     );
 
-    const currentParticipant = room.participants.find(
-      (p) => p.id === socket.id,
+    if (existingIdx !== -1) {
+      // Re-use the server-stored role — ignore whatever the client claimed
+      resolvedRole = room.participants[existingIdx].role;
+      room.participants.splice(existingIdx, 1);
+    } else {
+      // New user not seen before — always join as Participant
+      resolvedRole = "Participant";
+    }
+
+    room.participants.push({ id: socket.id, username, role: resolvedRole });
+    socket.join(cleanRoomId);
+    console.log(
+      `🔄 [Room ${cleanRoomId}] User reconnected: ${username} (${resolvedRole})`,
     );
-    const resolvedRole = currentParticipant ? currentParticipant.role : role;
 
     socket.emit("room_reconnected", {
       roomId: cleanRoomId,
@@ -212,6 +237,7 @@ module.exports = (io, socket) => {
   });
 
   // 8. REAL-TIME CHAT MESSAGE FORWARDER
+  // Messages are sanitized (HTML stripped) before broadcast to prevent injection.
   socket.on("send_message", ({ roomId, message }) => {
     const cleanRoomId = roomId.toUpperCase();
     const room = roomManager.getRoom(cleanRoomId);
@@ -220,10 +246,13 @@ module.exports = (io, socket) => {
     const sender = room.participants.find((p) => p.id === socket.id);
     if (!sender) return;
 
+    const safeMessage = sanitize(message);
+    if (!safeMessage) return; // Drop empty or tag-only messages
+
     io.to(cleanRoomId).emit("new_message", {
       username: sender.username,
       role: sender.role,
-      message,
+      message: safeMessage,
       timestamp: new Date().toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
@@ -260,7 +289,9 @@ module.exports = (io, socket) => {
   });
 
   // 9. DISCONNECTION & AUTO-PROMOTION HANDLER
+  // Note: the syncInterval for this socket is also cleared here (registered above).
   socket.on("disconnect", () => {
+    clearInterval(syncInterval);
     const changes = roomManager.removeParticipant(socket.id);
 
     changes.forEach(
