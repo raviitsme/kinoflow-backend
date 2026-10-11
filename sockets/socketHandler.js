@@ -7,33 +7,6 @@ const sanitize = (str) =>
 module.exports = (io, socket) => {
   console.log(`📡 Peer connection established: ${socket.id}`);
 
-  // Server-driven sync heartbeat: runs every 4s for every controller in every room.
-  // Moving this to the server fixes two issues:
-  //   1. Participants who become Moderators also keep peers aligned (not just the Host).
-  //   2. The Host client no longer needs a setInterval, simplifying frontend logic.
-  const syncInterval = setInterval(() => {
-    Object.keys(roomManager.rooms).forEach((roomId) => {
-      const room = roomManager.getRoom(roomId);
-      if (!room || room.playState !== "playing") return;
-
-      // Find the first available controller (Host preferred, then first Moderator)
-      const controller =
-        room.participants.find((p) => p.role === "Host") ||
-        room.participants.find((p) => p.role === "Moderator");
-
-      if (controller) {
-        // Broadcast a soft 'sync' to everyone except the controller
-        socket.to(roomId).emit("playback_broadcast", {
-          action: "sync",
-          time: room.currentTime,
-          sentAt: Date.now(),
-        });
-      }
-    });
-  }, 4000);
-
-  socket.on("disconnect", () => clearInterval(syncInterval));
-
   // 1. CREATE ROOM (Creator becomes Host)
   socket.on("create_room", ({ roomId, username }) => {
     const cleanRoomId = roomId.toUpperCase();
@@ -91,39 +64,47 @@ module.exports = (io, socket) => {
     });
   });
 
-  // 3. RECONNECT ROOM
-  // Security fix: the client-supplied `role` is never trusted directly.
-  // We look up the existing participant by username to recover their server-stored
-  // role. Only if they were previously the Host do we allow that privilege to persist.
+  // 3. RECONNECT ROOM (Handles Page Reload & Network Recovery)
   socket.on("reconnect_room", ({ roomId, username }) => {
     const cleanRoomId = roomId.toUpperCase();
     let room = roomManager.getRoom(cleanRoomId);
-    let resolvedRole;
 
     if (!room) {
-      // Room is gone — only recreate it if this user was the original creator.
-      // We can't verify that without a session store, so we expire the session.
       socket.emit("session_expired", {
         message: "The watch room has ended or no longer exists.",
       });
       return;
     }
 
-    // Find the user's existing server-side record by username
-    const existingIdx = room.participants.findIndex(
-      (p) => p.username === username,
-    );
-
-    if (existingIdx !== -1) {
-      // Re-use the server-stored role — ignore whatever the client claimed
-      resolvedRole = room.participants[existingIdx].role;
-      room.participants.splice(existingIdx, 1);
-    } else {
-      // New user not seen before — always join as Participant
-      resolvedRole = "Participant";
+    // Cancel pending disconnect grace period timer if this user is reloading
+    const timerKey = `${cleanRoomId}_${username}`;
+    if (roomManager.disconnectTimers[timerKey]) {
+      clearTimeout(roomManager.disconnectTimers[timerKey]);
+      delete roomManager.disconnectTimers[timerKey];
     }
 
-    room.participants.push({ id: socket.id, username, role: resolvedRole });
+    // Recover existing participant or match creator username
+    let participant = room.participants.find((p) => p.username === username);
+    let resolvedRole;
+
+    if (participant) {
+      participant.id = socket.id;
+      participant.disconnected = false;
+      resolvedRole = participant.role;
+    } else if (room.creatorUsername === username) {
+      resolvedRole = "Host";
+      participant = { id: socket.id, username, role: resolvedRole, disconnected: false };
+      room.participants.unshift(participant);
+    } else {
+      resolvedRole = "Participant";
+      participant = { id: socket.id, username, role: resolvedRole, disconnected: false };
+      room.participants.push(participant);
+    }
+
+    if (resolvedRole === "Host") {
+      room.creatorId = socket.id;
+    }
+
     socket.join(cleanRoomId);
     console.log(
       `🔄 [Room ${cleanRoomId}] User reconnected: ${username} (${resolvedRole})`,
@@ -182,8 +163,10 @@ module.exports = (io, socket) => {
       return;
     }
 
-    roomManager.updatePlayback(cleanRoomId, action, time);
+    // Keep server's cached playback position fresh
+    roomManager.updatePlayback(cleanRoomId, action === "sync" ? "play" : action, time);
 
+    // Broadcast to peers (excluding the sender)
     socket.to(cleanRoomId).emit("playback_broadcast", {
       action,
       time,
@@ -196,7 +179,6 @@ module.exports = (io, socket) => {
     const cleanRoomId = roomId.toUpperCase();
     const senderRole = roomManager.getUserRole(cleanRoomId, socket.id);
 
-    // Only the primary Host can promote or demote members
     if (senderRole !== "Host") {
       console.log(`🚫 Unauthorized promotion attempt by ${socket.id}`);
       return;
@@ -213,12 +195,10 @@ module.exports = (io, socket) => {
         `🎖️ [Room ${cleanRoomId}] User ${result.participant.username} is now ${newRole}`,
       );
 
-      // Broadcast the updated roster to the whole room
       io.to(cleanRoomId).emit("room_update", {
         participants: result.participants,
       });
 
-      // Notify the specific promoted user directly so their UI updates
       io.to(targetUserId).emit("role_assigned", {
         role: newRole,
       });
@@ -237,7 +217,6 @@ module.exports = (io, socket) => {
   });
 
   // 8. REAL-TIME CHAT MESSAGE FORWARDER
-  // Messages are sanitized (HTML stripped) before broadcast to prevent injection.
   socket.on("send_message", ({ roomId, message }) => {
     const cleanRoomId = roomId.toUpperCase();
     const room = roomManager.getRoom(cleanRoomId);
@@ -247,7 +226,7 @@ module.exports = (io, socket) => {
     if (!sender) return;
 
     const safeMessage = sanitize(message);
-    if (!safeMessage) return; // Drop empty or tag-only messages
+    if (!safeMessage) return;
 
     io.to(cleanRoomId).emit("new_message", {
       username: sender.username,
@@ -260,24 +239,21 @@ module.exports = (io, socket) => {
     });
   });
 
+  // 9. REMOVE PARTICIPANT (Kick)
   socket.on("remove_participant", ({ roomId, targetUserId }) => {
     const cleanRoomId = roomId.toUpperCase();
     const senderRole = roomManager.getUserRole(cleanRoomId, socket.id);
 
-    // Only the primary Host can kick members
     if (senderRole !== "Host") {
       console.log(`🚫 Unauthorized kick attempt by ${socket.id}`);
       return;
     }
 
-    // 1. Notify the target user that they are being kicked
     io.to(targetUserId).emit("participant_removed", { roomId: cleanRoomId });
 
-    // 2. Remove them from the room state
     const changes = roomManager.removeParticipant(targetUserId);
 
-    // 3. Broadcast the updated roster to the remaining users
-    changes.forEach(({ roomId: rId, remainingParticipants }) => {
+    changes.forEach(({ remainingParticipants }) => {
       io.to(cleanRoomId).emit("room_update", {
         participants: remainingParticipants,
       });
@@ -288,42 +264,79 @@ module.exports = (io, socket) => {
     );
   });
 
-  // 9. DISCONNECTION & AUTO-PROMOTION HANDLER
-  // Note: the syncInterval for this socket is also cleared here (registered above).
-  socket.on("disconnect", () => {
-    clearInterval(syncInterval);
-    const changes = roomManager.removeParticipant(socket.id);
+  // 10. EXPLICIT LEAVE ROOM (Instant removal without grace period)
+  socket.on("leave_room", ({ roomId }) => {
+    const cleanRoomId = (roomId || "").toUpperCase();
+    const result = roomManager.handleSocketDisconnect(socket.id);
+    if (!result) return;
 
-    changes.forEach(
-      ({
-        roomId,
-        removedUser,
-        newHost,
-        isRoomEmpty,
-        remainingParticipants,
-      }) => {
-        console.log(`User left [Room ${roomId}]: ${removedUser.username}`);
+    const { participant } = result;
+    const timerKey = `${cleanRoomId}_${participant.username}`;
+    if (roomManager.disconnectTimers[timerKey]) {
+      clearTimeout(roomManager.disconnectTimers[timerKey]);
+      delete roomManager.disconnectTimers[timerKey];
+    }
 
-        if (!isRoomEmpty) {
-          io.to(roomId).emit("room_update", {
-            participants: remainingParticipants,
+    const cleanup = roomManager.finalizeParticipantRemoval(cleanRoomId, participant.username, true);
+    if (cleanup) {
+      const { newHost, isRoomEmpty, remainingParticipants } = cleanup;
+      if (!isRoomEmpty) {
+        io.to(cleanRoomId).emit("room_update", {
+          participants: remainingParticipants,
+        });
+        if (newHost) {
+          io.to(cleanRoomId).emit("host_changed", {
+            hostId: newHost.id,
+            hostName: newHost.username,
           });
-
-          if (newHost) {
-            console.log(`Auto-promoted new Host: ${newHost.username}`);
-            io.to(roomId).emit("host_changed", {
-              hostId: newHost.id,
-              hostName: newHost.username,
-            });
-          }
-        } else {
-          console.log(`Room ${roomId} deleted (empty).`);
         }
-      },
-    );
+      }
+    }
   });
 
-  // 10. PARTICIPANT CHANGE REQUEST (Forwarded to Host/Moderators)
+  // 11. DISCONNECTION HANDLER (With 15-second Grace Period for Page Reloads)
+  socket.on("disconnect", () => {
+    const result = roomManager.handleSocketDisconnect(socket.id);
+    if (!result) return;
+
+    const { roomId, participant } = result;
+    console.log(
+      `⏳ [Room ${roomId}] User disconnected (grace period started): ${participant.username} (${participant.role})`,
+    );
+
+    const timerKey = `${roomId}_${participant.username}`;
+    if (roomManager.disconnectTimers[timerKey]) {
+      clearTimeout(roomManager.disconnectTimers[timerKey]);
+    }
+
+    // 15-second grace period for reload or reconnect
+    roomManager.disconnectTimers[timerKey] = setTimeout(() => {
+      delete roomManager.disconnectTimers[timerKey];
+      const cleanup = roomManager.finalizeParticipantRemoval(roomId, participant.username);
+      if (!cleanup) return;
+
+      const { newHost, isRoomEmpty, remainingParticipants } = cleanup;
+      console.log(`🚪 [Room ${roomId}] Grace period expired for: ${participant.username}`);
+
+      if (!isRoomEmpty) {
+        io.to(roomId).emit("room_update", {
+          participants: remainingParticipants,
+        });
+
+        if (newHost) {
+          console.log(`Auto-promoted new Host: ${newHost.username}`);
+          io.to(roomId).emit("host_changed", {
+            hostId: newHost.id,
+            hostName: newHost.username,
+          });
+        }
+      } else {
+        console.log(`Room ${roomId} deleted (empty after grace period).`);
+      }
+    }, 15000);
+  });
+
+  // 12. PARTICIPANT CHANGE REQUEST (Forwarded to Host/Moderators)
   socket.on("request_change", ({ roomId, type, payload }) => {
     const cleanRoomId = roomId.toUpperCase();
     const room = roomManager.getRoom(cleanRoomId);
@@ -332,7 +345,6 @@ module.exports = (io, socket) => {
     const sender = room.participants.find((p) => p.id === socket.id);
     if (!sender) return;
 
-    // Route request to users with control permissions
     const controllers = room.participants.filter(
       (p) => p.role === "Host" || p.role === "Moderator"
     );
@@ -350,7 +362,7 @@ module.exports = (io, socket) => {
     });
   });
 
-  // 11. APPROVE / DECLINE CHANGE REQUEST (Host/Moderator only)
+  // 13. APPROVE / DECLINE CHANGE REQUEST (Host/Moderator only)
   socket.on("resolve_change_request", ({ roomId, requestId, senderId, approved, type, payload }) => {
     const cleanRoomId = roomId.toUpperCase();
     const role = roomManager.getUserRole(cleanRoomId, socket.id);

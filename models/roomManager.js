@@ -5,6 +5,7 @@
 class RoomManager {
   constructor() {
     this.rooms = {};
+    this.disconnectTimers = {}; // Key: `${roomId}_${username}` -> setTimeout ID
   }
 
   // Create a new room (creator will be the host!)
@@ -15,10 +16,11 @@ class RoomManager {
       };
     }
 
-    const host = { id: socketId, username, role: "Host" };
+    const host = { id: socketId, username, role: "Host", disconnected: false };
 
     this.rooms[roomId] = {
       creatorId: socketId,
+      creatorUsername: username,
       videoId: "LXb3EKWsInQ",
       playState: "paused",
       currentTime: 0,
@@ -37,7 +39,7 @@ class RoomManager {
       };
     }
 
-    const participant = { id: socketId, username, role: "Participant" };
+    const participant = { id: socketId, username, role: "Participant", disconnected: false };
     room.participants.push(participant);
 
     return { room, participant };
@@ -87,6 +89,58 @@ class RoomManager {
     return true;
   }
 
+  // Marks a socket as temporarily disconnected when network or page reload occurs
+  handleSocketDisconnect(socketId) {
+    for (const roomId of Object.keys(this.rooms)) {
+      const room = this.rooms[roomId];
+      const participant = room.participants.find((p) => p.id === socketId);
+      if (participant) {
+        participant.disconnected = true;
+        return { roomId, participant, room };
+      }
+    }
+    return null;
+  }
+
+  // Permanently cleans up a participant when grace period expires or when explicitly leaving
+  finalizeParticipantRemoval(roomId, username, force = false) {
+    const room = this.rooms[roomId];
+    if (!room) return null;
+
+    const index = room.participants.findIndex((p) => p.username === username);
+    if (index === -1) return null;
+
+    const participant = room.participants[index];
+    // If user reconnected in the meantime and this wasn't a forced removal, don't remove
+    if (!participant.disconnected && !force) return null;
+
+    const [removedUser] = room.participants.splice(index, 1);
+    let newHost = null;
+
+    // If host left, auto-promote next available active participant
+    if (removedUser.role === "Host" && room.participants.length > 0) {
+      // Prefer an active participant who is not disconnected
+      const candidate = room.participants.find((p) => !p.disconnected) || room.participants[0];
+      candidate.role = "Host";
+      newHost = candidate;
+      room.creatorId = candidate.id;
+    }
+
+    const isRoomEmpty = room.participants.length === 0;
+    if (isRoomEmpty) {
+      delete this.rooms[roomId];
+    }
+
+    return {
+      roomId,
+      removedUser,
+      newHost,
+      isRoomEmpty,
+      remainingParticipants: room.participants,
+    };
+  }
+
+  // Immediate removal (e.g. Host kick)
   removeParticipant(socketId) {
     const changes = [];
 
