@@ -291,4 +291,49 @@ module.exports = (io, socket) => {
       },
     );
   });
+
+  socket.on("request_change", ({ roomId, type, payload }) => {
+    const cleanRoomId = roomId.toUpperCase();
+    const room = roomManager.getRoom(cleanRoomId);
+    if (!room) return;
+    const sender = room.participants.find((p) => p.id === socket.id);
+    if (!sender) return;
+    // Find all Hosts and Moderators in the room
+    const controllers = room.participants.filter(
+      (p) => p.role === "Host" || p.role === "Moderator"
+    );
+    const requestData = {
+      requestId: `${socket.id}-${Date.now()}`,
+      senderId: socket.id,
+      senderUsername: sender.username,
+      type, // e.g. "change_video"
+      payload, // e.g. { videoId: "..." }
+    };
+    // Forward the request only to Host & Moderators
+    controllers.forEach((ctrl) => {
+      io.to(ctrl.id).emit("incoming_change_request", requestData);
+    });
+  });
+  
+  // 2. Host or Moderator resolves (Approves / Rejects) the request
+  socket.on("resolve_change_request", ({ roomId, requestId, senderId, approved, type, payload }) => {
+    const cleanRoomId = roomId.toUpperCase();
+    const role = roomManager.getUserRole(cleanRoomId, socket.id);
+    // Ensure only Host or Moderator can approve
+    if (role !== "Host" && role !== "Moderator") return;
+    // Notify the requesting participant of the decision
+    io.to(senderId).emit("request_response", {
+      requestId,
+      approved,
+      type,
+      message: approved ? "Your request was approved!" : "Your request was declined by the host.",
+    });
+    // If approved, execute the change across the entire room
+    if (approved) {
+      if (type === "change_video" && payload?.videoId) {
+        roomManager.changeVideo(cleanRoomId, payload.videoId);
+        io.to(cleanRoomId).emit("video_changed", { videoId: payload.videoId });
+      }
+    }
+  });
 };
