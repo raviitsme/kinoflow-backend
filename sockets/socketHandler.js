@@ -166,7 +166,7 @@ module.exports = (io, socket) => {
     });
   });
 
-  // 6. ✅ CORRECTED: Un-nested "promote_user" event listener (Registered at root level)
+  // 6. PROMOTE/DEMOTE USER ROLE (Host only)
   socket.on("promote_user", ({ roomId, targetUserId, newRole }) => {
     const cleanRoomId = roomId.toUpperCase();
     const senderRole = roomManager.getUserRole(cleanRoomId, socket.id);
@@ -292,43 +292,49 @@ module.exports = (io, socket) => {
     );
   });
 
+  // 10. PARTICIPANT CHANGE REQUEST (Forwarded to Host/Moderators)
   socket.on("request_change", ({ roomId, type, payload }) => {
     const cleanRoomId = roomId.toUpperCase();
     const room = roomManager.getRoom(cleanRoomId);
     if (!room) return;
+
     const sender = room.participants.find((p) => p.id === socket.id);
     if (!sender) return;
-    // Find all Hosts and Moderators in the room
+
+    // Route request to users with control permissions
     const controllers = room.participants.filter(
       (p) => p.role === "Host" || p.role === "Moderator"
     );
+
     const requestData = {
       requestId: `${socket.id}-${Date.now()}`,
       senderId: socket.id,
       senderUsername: sender.username,
-      type, // e.g. "change_video"
-      payload, // e.g. { videoId: "..." }
+      type,
+      payload,
     };
-    // Forward the request only to Host & Moderators
+
     controllers.forEach((ctrl) => {
       io.to(ctrl.id).emit("incoming_change_request", requestData);
     });
   });
-  
-  // 2. Host or Moderator resolves (Approves / Rejects) the request
+
+  // 11. APPROVE / DECLINE CHANGE REQUEST (Host/Moderator only)
   socket.on("resolve_change_request", ({ roomId, requestId, senderId, approved, type, payload }) => {
     const cleanRoomId = roomId.toUpperCase();
     const role = roomManager.getUserRole(cleanRoomId, socket.id);
-    // Ensure only Host or Moderator can approve
+
     if (role !== "Host" && role !== "Moderator") return;
-    // Notify the requesting participant of the decision
+
+    // Send decision back to the requesting participant
     io.to(senderId).emit("request_response", {
       requestId,
       approved,
       type,
       message: approved ? "Your request was approved!" : "Your request was declined by the host.",
     });
-    // If approved, execute the change across the entire room
+
+    // Apply the requested change if approved
     if (approved) {
       if (type === "change_video" && payload?.videoId) {
         roomManager.changeVideo(cleanRoomId, payload.videoId);
